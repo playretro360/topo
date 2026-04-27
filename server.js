@@ -2267,6 +2267,201 @@ async function discoverViaBrowser({ category_id, keyword, sort = 'sales', limit 
 
 
 // ══════════════════════════════════════════════════════════════════════════
+// discoverViaHtmlDom — Scraping da DOM renderizada via CDP browser
+// Quando a API v4 retorna vazio, abrir a página HTML real, esperar JS
+// hidratar, e extrair produtos do DOM. Funciona em qualquer página listing
+// da Shopee (Mais-Vendidos, busca, categoria, home).
+// ══════════════════════════════════════════════════════════════════════════
+async function discoverViaHtmlDom({ url, limit = 60, scrolls = 2 } = {}) {
+  if (!BD_WSS) throw new Error('BD_WSS nao configurado');
+  if (!url) throw new Error('url obrigatoria');
+
+  const ws = new WebSocket(BD_WSS, { handshakeTimeout: 20000 });
+  await new Promise((resolve, reject) => {
+    ws.once('open', resolve);
+    ws.once('error', reject);
+    setTimeout(() => reject(new Error('WS timeout')), 20000);
+  });
+  const cdp = new CDPBrowser(ws);
+
+  try {
+    const newTarget = await cdp.send('Target.createTarget', {
+      url: 'about:blank',
+      newWindow: false,
+      background: true,
+    });
+    const newTargetId = newTarget.targetId;
+    const { sessionId: sid2 } = await cdp.send('Target.attachToTarget', { targetId: newTargetId, flatten: true });
+    const s = cdp.session(sid2);
+    await s.send('Page.enable', {}).catch(()=>{});
+    await s.send('Network.enable', {}).catch(()=>{});
+
+    // Setar viewport desktop com tamanho razoável pra carregar mais cards
+    try {
+      await s.send('Emulation.setDeviceMetricsOverride', {
+        width: 1280, height: 1800, deviceScaleFactor: 1, mobile: false,
+      });
+    } catch(e) {}
+
+    // Navegar
+    try {
+      await s.send('Page.navigate', { url });
+    } catch(e) {}
+
+    // Aguardar carregamento + hidratação JS pesada
+    await new Promise(r => setTimeout(r, 8000));
+
+    // Scroll progressivo pra forçar lazy-load de mais cards
+    for (let i = 0; i < scrolls; i++) {
+      try {
+        await s.send('Runtime.evaluate', {
+          expression: 'window.scrollBy(0, window.innerHeight * 1.5)',
+          awaitPromise: false,
+        });
+      } catch(e) {}
+      await new Promise(r => setTimeout(r, 2500));
+    }
+
+    // Voltar pro topo (alguns sites lazy-load só ao voltar)
+    try {
+      await s.send('Runtime.evaluate', {
+        expression: 'window.scrollTo(0, 0)',
+        awaitPromise: false,
+      });
+    } catch(e) {}
+    await new Promise(r => setTimeout(r, 1500));
+
+    // Extrair produtos do DOM
+    const extractExpr = `(()=>{
+      try {
+        // 1) Tentar extrair de window.__INITIAL_STATE__ / __APP_DATA__ (SSR data)
+        const stateKeys = ['__INITIAL_STATE__','__APP_DATA__','__NUXT__','__NEXT_DATA__','__INITIAL_DATA__'];
+        for (const k of stateKeys) {
+          if (window[k]) {
+            try {
+              const j = typeof window[k] === 'string' ? JSON.parse(window[k]) : window[k];
+              return JSON.stringify({ source: 'window.' + k, state: j });
+            } catch(e) {}
+          }
+        }
+
+        // 2) DOM scraping: links com pattern /xxxx-i.SHOPID.ITEMID
+        const links = Array.from(document.querySelectorAll('a[href*=".i."]'));
+        const seen = new Set();
+        const items = [];
+        for (const a of links) {
+          if (items.length >= ${limit}) break;
+          const href = a.getAttribute('href') || '';
+          const m = href.match(/i\\.(\\d+)\\.(\\d+)/);
+          if (!m) continue;
+          const shopid = m[1], itemid = m[2];
+          const key = shopid + ':' + itemid;
+          if (seen.has(key)) continue;
+          seen.add(key);
+
+          // Tentar pegar o card (parent ancestral mais útil)
+          let card = a;
+          for (let p = a; p && p !== document.body; p = p.parentElement) {
+            const txt = (p.textContent || '').trim();
+            if (txt.length > 20 && txt.length < 600) { card = p; break; }
+          }
+
+          // Imagem
+          const img = card.querySelector('img');
+          const image = img?.src || img?.dataset?.src || img?.dataset?.original || '';
+          // Pra Shopee CDN: extrair só o hash
+          const imgHashMatch = image.match(/\\/file\\/([a-f0-9_]+)/);
+          const imageHash = imgHashMatch ? imgHashMatch[1] : '';
+
+          // Nome: alt do img, ou primeiro texto longo
+          let name = (img?.alt || '').trim();
+          if (!name) {
+            // Pegar o texto do card sem moeda/preço
+            const fullText = (card.textContent || '').trim().replace(/\\s+/g, ' ');
+            const stripped = fullText.replace(/R\\$\\s*[\\d.,]+/g, '').replace(/\\d+\\s*vendidos?/gi, '').replace(/[\\d,.]+\\s*estrelas?/gi, '').trim();
+            name = stripped.slice(0, 200);
+          }
+
+          // Preço: regex no texto do card
+          const txt = card.textContent || '';
+          const priceMatch = txt.match(/R\\$\\s*([\\d.]+,?\\d*)/);
+          let priceCents = 0;
+          if (priceMatch) {
+            const numStr = priceMatch[1].replace(/\\./g,'').replace(',','.');
+            priceCents = Math.round(parseFloat(numStr) * 100);
+          }
+
+          // Sold: regex
+          let sold = 0;
+          const soldMatch = txt.match(/(\\d+(?:[.,]\\d+)?(?:\\s*[mk])?)\\s*vendidos?/i);
+          if (soldMatch) {
+            let s = soldMatch[1].toLowerCase().replace(',', '.');
+            const mul = s.includes('mil') ? 1000 : (s.endsWith('k') ? 1000 : (s.endsWith('m') ? 1000000 : 1));
+            s = s.replace(/[mk]|mil/g, '');
+            sold = Math.round(parseFloat(s) * mul);
+          }
+
+          // Rating
+          let rating = 0;
+          const rm = txt.match(/(\\d[.,]\\d)\\s*estrelas?|★\\s*(\\d[.,]\\d)/);
+          if (rm) rating = parseFloat((rm[1]||rm[2]).replace(',','.'));
+
+          // shop_location (cidade/estado)
+          let shopLocation = '';
+          const locMatch = txt.match(/(São Paulo|Rio de Janeiro|Minas Gerais|Paraná|Bahia|Pernambuco|Goiás|Ceará|Santa Catarina|Rio Grande do Sul|Espírito Santo|Distrito Federal|Mato Grosso|[A-ZÀ-Ú][a-zà-ú]+\\s*\\([A-Z]{2}\\))/);
+          if (locMatch) shopLocation = locMatch[0];
+
+          if (name && priceCents > 0) {
+            items.push({
+              itemid: itemid,
+              shopid: shopid,
+              name: name,
+              image: imageHash || image,
+              price: priceCents * 1000, // convert cents → "micros" pra bater com formato API Shopee
+              price_min: priceCents * 1000,
+              historical_sold: sold,
+              sold: sold,
+              item_rating: { rating_star: rating, rating_count: [0,0,0,0,0,0] },
+              shop_location: shopLocation,
+              shop_name: shopLocation,
+              stock: 99, // placeholder
+              liked_count: 0,
+              view_count: 0,
+              source_html: true,
+            });
+          }
+        }
+        return JSON.stringify({ source: 'dom_scrape', items });
+      } catch(e) {
+        return JSON.stringify({ error: String(e.message || e), source: 'dom_scrape_err' });
+      }
+    })()`;
+
+    const result = await s.send('Runtime.evaluate', {
+      expression: extractExpr,
+      returnByValue: true,
+    }).catch(e => ({ result: { value: JSON.stringify({ error: 'evaluate_failed: ' + (e.message||e) }) } }));
+
+    let parsed;
+    try {
+      parsed = JSON.parse(result?.result?.value || '{}');
+    } catch(e) {
+      parsed = { error: 'parse_failed', raw: result?.result?.value?.slice(0, 500) };
+    }
+
+    // Cleanup
+    try { await cdp.send('Target.closeTarget', { targetId: newTargetId }); } catch(e) {}
+    try { ws.close(); } catch(e) {}
+
+    return parsed;
+  } catch (e) {
+    try { ws.close(); } catch(_){}
+    throw e;
+  }
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════
 // buyerActionViaBrowser — Faz POST/GET autenticado em endpoint Shopee API
 // usando Browser CDP (browser real via Bright Data Scraping Browser).
 // Bypassa anti-bot, captcha simples e validações de origin.
@@ -2688,6 +2883,62 @@ http.createServer(async (req, res) => {
       debug_errors: browserResult?.errors || [],
       debug_previews: browserResult?.previews || [],
     }));
+  }
+
+  // ══════════════════════════════════════════════════════════════════
+  // /discover-html — Scraping via DOM da Shopee (browser CDP renderiza
+  // a página real, espera JS hidratar, extrai produtos do DOM)
+  // Body: { url?, category_id?, keyword?, limit?, scrolls? }
+  //   Se url ausente, monta URL da Shopee BR baseada em category_id/keyword
+  // ══════════════════════════════════════════════════════════════════
+  if (req.method === 'POST' && p === '/discover-html') {
+    const d = await readBody();
+    if (!BD_WSS) {
+      res.writeHead(503);
+      return res.end(JSON.stringify({ ok: false, error: 'BD_WSS nao configurado' }));
+    }
+    
+    let target = d.url;
+    if (!target) {
+      if (d.category_id) {
+        target = `https://shopee.com.br/Mais-Vendidos-cat.${d.category_id}`;
+      } else if (d.keyword) {
+        target = `https://shopee.com.br/buscar?keyword=${encodeURIComponent(d.keyword)}&sortBy=sales`;
+      } else {
+        target = `https://shopee.com.br/Mais-Vendidos`;
+      }
+    }
+    
+    try {
+      const r = await discoverViaHtmlDom({
+        url: target,
+        limit: Math.min(d.limit || 60, 100),
+        scrolls: d.scrolls ?? 2,
+      });
+      
+      if (r.items && r.items.length > 0) {
+        res.writeHead(200);
+        return res.end(JSON.stringify({
+          ok: true,
+          items: r.items,
+          total: r.items.length,
+          source: r.source,
+          url: target,
+        }));
+      }
+      
+      res.writeHead(503);
+      return res.end(JSON.stringify({
+        ok: false,
+        error: 'DOM scrape vazio',
+        items: [],
+        url: target,
+        debug: r,
+      }));
+    } catch(e) {
+      res.writeHead(500);
+      return res.end(JSON.stringify({ ok: false, error: e.message, items: [] }));
+    }
   }
 
   if (req.method === 'POST' && p === '/search-public') {
