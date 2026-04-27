@@ -2456,7 +2456,7 @@ async function discoverViaHtmlDom({ url, limit = 60, scrolls = 2 } = {}) {
               itemid: c.itemid,
               shopid: c.shopid,
               catid: c.catid || '',
-              name: name || `Item ${c.itemid}`,
+              name: name || ('Item ' + c.itemid),
               image: imageHash || image,
               price: priceCents * 1000,
               price_min: priceCents * 1000,
