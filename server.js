@@ -2893,21 +2893,75 @@ http.createServer(async (req, res) => {
           }
         }
         
-        // Residential também vazio → retorna 503 com debug
+        // Residential também vazio → tenta HTML DOM scrape como último fallback
+        try {
+          let htmlUrl;
+          if (d.category_id) {
+            htmlUrl = `https://shopee.com.br/search?fe_categoryids=${d.category_id}&page=0&sortBy=sales`;
+          } else if (d.keyword) {
+            htmlUrl = `https://shopee.com.br/search?keyword=${encodeURIComponent(d.keyword)}&page=0&sortBy=sales`;
+          } else {
+            htmlUrl = 'https://shopee.com.br/search?keyword=oferta&page=0&sortBy=sales';
+          }
+          const htmlR = await discoverViaHtmlDom({
+            url: htmlUrl,
+            limit: Math.min(d.limit || 60, 100),
+            scrolls: 3,
+          });
+          if (htmlR.items && htmlR.items.length > 0) {
+            res.writeHead(200);
+            return res.end(JSON.stringify({
+              ok: true,
+              items: htmlR.items,
+              total: htmlR.items.length,
+              source: 'html_dom_scrape',
+            }));
+          }
+        } catch(e) {
+          // se HTML scrape lançou, segue pro retorno de erro abaixo
+        }
+        
+        // Tudo falhou
         res.writeHead(503);
         return res.end(JSON.stringify({
           ok: false,
-          error: 'Nenhum produto encontrado (browser e residential vazios)',
+          error: 'Nenhum produto encontrado (browser, residential e HTML vazios)',
           items: [],
           debug_browser_err: browserErr,
           debug_browser_previews: browserResult?.previews || [],
           debug_residential: { status: resi.status, data_keys: Object.keys(resi.data || {}), raw_preview: (resi.raw || '').slice(0, 500) },
         }));
       } catch(e) {
+        // Residential lançou (403, timeout) → fallback HTML DOM
+        try {
+          let htmlUrl;
+          if (d.category_id) {
+            htmlUrl = `https://shopee.com.br/search?fe_categoryids=${d.category_id}&page=0&sortBy=sales`;
+          } else if (d.keyword) {
+            htmlUrl = `https://shopee.com.br/search?keyword=${encodeURIComponent(d.keyword)}&page=0&sortBy=sales`;
+          } else {
+            htmlUrl = 'https://shopee.com.br/search?keyword=oferta&page=0&sortBy=sales';
+          }
+          const htmlR = await discoverViaHtmlDom({
+            url: htmlUrl,
+            limit: Math.min(d.limit || 60, 100),
+            scrolls: 3,
+          });
+          if (htmlR.items && htmlR.items.length > 0) {
+            res.writeHead(200);
+            return res.end(JSON.stringify({
+              ok: true,
+              items: htmlR.items,
+              total: htmlR.items.length,
+              source: 'html_dom_scrape',
+            }));
+          }
+        } catch(e2) {}
+        
         res.writeHead(503);
         return res.end(JSON.stringify({
           ok: false,
-          error: 'browser+residential falharam',
+          error: 'browser+residential+html falharam',
           items: [],
           debug_browser_err: browserErr,
           debug_residential_err: e.message,
