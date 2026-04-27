@@ -2551,6 +2551,138 @@ async function discoverViaHtmlDom({ url, limit = 60, scrolls = 2 } = {}) {
 
 
 // ══════════════════════════════════════════════════════════════════════════
+// scrapePdpDomViaCdp — Extrai dados de PDP individual via DOM (fallback CDP)
+// Usado quando BD Residential bloqueia /api/v4/pdp/get_pc da Shopee BR
+// ══════════════════════════════════════════════════════════════════════════
+async function scrapePdpDomViaCdp(pdpUrl) {
+  if (!BD_WSS) throw new Error('BD_WSS nao configurado');
+  
+  const ws = new WebSocket(BD_WSS, { handshakeTimeout: 20000 });
+  await new Promise((resolve, reject) => {
+    ws.once('open', resolve);
+    ws.once('error', reject);
+    setTimeout(() => reject(new Error('WS timeout')), 20000);
+  });
+  const cdp = new CDPBrowser(ws);
+
+  try {
+    const newTarget = await cdp.send('Target.createTarget', { url: 'about:blank', newWindow: false, background: true });
+    const newTargetId = newTarget.targetId;
+    const { sessionId: sid2 } = await cdp.send('Target.attachToTarget', { targetId: newTargetId, flatten: true });
+    const s = cdp.session(sid2);
+    await s.send('Page.enable', {}).catch(()=>{});
+    await s.send('Network.enable', {}).catch(()=>{});
+
+    try { await s.send('Page.navigate', { url: pdpUrl }); } catch(e) {}
+    await new Promise(r => setTimeout(r, 9000));
+
+    const expr = `(()=>{
+      try {
+        // Extrair itemid/shopid da URL atual
+        const m = location.href.match(/\\/product\\/(\\d+)\\/(\\d+)/) || location.href.match(/i\\.(\\d+)\\.(\\d+)/);
+        const shopid = m ? m[1] : '';
+        const itemid = m ? m[2] : '';
+        const txt = document.body?.innerText || '';
+
+        // Title
+        const title = document.title.replace(/\\s*\\|\\s*Shopee.*/i, '').trim();
+        const h1 = document.querySelector('h1')?.textContent?.trim() || '';
+
+        // Preço atual: R$ X,XX (geralmente o maior preço com R$)
+        const prices = [];
+        const priceRe = /R\\$\\s*([\\d.]+,?\\d*)/g;
+        let pm;
+        while ((pm = priceRe.exec(txt)) !== null) {
+          const num = parseFloat(pm[1].replace(/\\./g,'').replace(',','.'));
+          if (num > 0) prices.push(num);
+        }
+        const priceCents = prices.length ? Math.round(prices[0] * 100) : 0;
+
+        // Sold — Shopee BR PDP mostra "X vendidos" no header
+        let sold = 0;
+        const soldMatch = txt.match(/([\\d.,]+\\s*(?:mil|k|m)?)\\s*vendidos?/i);
+        if (soldMatch) {
+          let s = soldMatch[1].toLowerCase().replace(',', '.');
+          const mul = s.includes('mil') ? 1000 : (s.endsWith('k') ? 1000 : (s.endsWith('m') ? 1000000 : 1));
+          s = s.replace(/[mk]|mil/g, '').trim();
+          sold = Math.round(parseFloat(s) * mul);
+        }
+
+        // Rating
+        let rating = 0;
+        const rm = txt.match(/(\\d[.,]\\d)\\s*(?:de\\s*\\d+\\.?\\d*\\s*)?(?:estrelas?|avalia|★)/i) || txt.match(/(\\d[.,]\\d)\\s*★/);
+        if (rm) rating = parseFloat(rm[1].replace(',','.'));
+
+        // Rating count
+        let ratingCount = 0;
+        const rcMatch = txt.match(/([\\d.,]+\\s*(?:mil|k)?)\\s*(?:avalia|classifica)/i);
+        if (rcMatch) {
+          let s = rcMatch[1].toLowerCase().replace(',', '.');
+          const mul = s.includes('mil') ? 1000 : (s.endsWith('k') ? 1000 : 1);
+          s = s.replace(/[k]|mil/g, '').trim();
+          ratingCount = Math.round(parseFloat(s) * mul);
+        }
+
+        // Stock — "X disponíveis" ou "X em estoque"
+        let stock = 0;
+        const stMatch = txt.match(/([\\d.,]+)\\s*(?:disponíve|em estoque|peças?)/i);
+        if (stMatch) stock = parseInt(stMatch[1].replace(/[.,]/g,'')) || 0;
+
+        // Shop info — geralmente "X seguidores" "X produtos" "ativo há X"
+        let shopName = '';
+        let shopFollowers = 0;
+        let shopAgeText = '';
+        const shopBlock = Array.from(document.querySelectorAll('section, div, header'))
+          .find(el => /seguidor|seguidores|ativo h|produtos/.test(el.textContent || ''));
+        if (shopBlock) {
+          const stxt = shopBlock.textContent || '';
+          const fm = stxt.match(/([\\d.,]+\\s*(?:mil|k|m)?)\\s*seguidor/i);
+          if (fm) {
+            let s = fm[1].toLowerCase().replace(',', '.');
+            const mul = s.includes('mil') ? 1000 : (s.endsWith('k') ? 1000 : (s.endsWith('m') ? 1000000 : 1));
+            s = s.replace(/[mk]|mil/g, '').trim();
+            shopFollowers = Math.round(parseFloat(s) * mul);
+          }
+          const am = stxt.match(/ativo h(?:á|a)\\s*([^,\\n]+)/i);
+          if (am) shopAgeText = am[1].trim().slice(0, 40);
+        }
+        const shopNameEl = document.querySelector('a[href*="/shop/"], a[href*="/loja/"]');
+        if (shopNameEl) shopName = shopNameEl.textContent?.trim() || '';
+
+        return JSON.stringify({
+          itemid, shopid,
+          name: title || h1,
+          price: priceCents * 1000,
+          historical_sold: sold,
+          item_rating: { rating_star: rating, rating_count: [ratingCount,0,0,0,0,0] },
+          stock,
+          shop_name: shopName,
+          shop_followers: shopFollowers,
+          shop_age_text: shopAgeText,
+          source: 'cdp_pdp_dom',
+        });
+      } catch(e) {
+        return JSON.stringify({ error: 'pdp_extract_err: ' + (e.message || e) });
+      }
+    })()`;
+
+    const result = await s.send('Runtime.evaluate', { expression: expr, returnByValue: true })
+      .catch(e => ({ result: { value: JSON.stringify({ error: 'evaluate_failed' }) } }));
+
+    let parsed = {};
+    try { parsed = JSON.parse(result?.result?.value || '{}'); } catch(e) { parsed = { error: 'parse_failed' }; }
+
+    try { await cdp.send('Target.closeTarget', { targetId: newTargetId }); } catch(e) {}
+    try { ws.close(); } catch(e) {}
+    return parsed;
+  } catch (e) {
+    try { ws.close(); } catch(_){}
+    throw e;
+  }
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════
 // buyerActionViaBrowser — Faz POST/GET autenticado em endpoint Shopee API
 // usando Browser CDP (browser real via Bright Data Scraping Browser).
 // Bypassa anti-bot, captcha simples e validações de origin.
@@ -3343,6 +3475,25 @@ http.createServer(async (req, res) => {
           } catch(e) { errors.push('models parse: ' + e.message); }
         }
       } catch(e) { errors.push('html-fallback: ' + e.message); }
+    }
+    // Fallback final: CDP browser scrape do PDP HTML (quando BD residential bloqueia /api/v4)
+    if (!itemData && BD_WSS) {
+      try {
+        const pdpUrl = d.url || `https://shopee.com.br/product/${d.shopid}/${d.itemid}`;
+        const r = await discoverViaHtmlDom({ url: pdpUrl, limit: 1, scrolls: 1 });
+        const debug = r?.debug || {};
+        // No PDP, extrai dados via DOM: title, sold, rating, shop, etc.
+        // O discoverViaHtmlDom já volta com debug ricos; vou criar uma função especifica abaixo
+        const pdpData = await scrapePdpDomViaCdp(pdpUrl);
+        if (pdpData && pdpData.itemid) {
+          itemData = pdpData;
+          errors.push('cdp-pdp: ok via dom_scrape');
+        } else {
+          errors.push('cdp-pdp: ' + (pdpData?.error || 'no_data'));
+        }
+      } catch(e) {
+        errors.push('cdp-pdp: ' + (e.message || e));
+      }
     }
     if (!itemData && !modelsData) {
       res.writeHead(404);
