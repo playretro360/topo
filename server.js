@@ -1,12 +1,3 @@
-// Vendry Sync Server v14.1 — REFRESH HIERARCHY FIX (L1 → L2 → L3)
-// FIX: refresh_token ANTES do browser, validação real (exige SPC_ST + shop_name),
-//      merge seguro (não sobrescreve tokens com vazios), 5 endpoints de refresh
-// GERADOR AUTOMÁTICO: paths × versões × variações = cobertura total Shopee
-// INDETECTÁVEL: brd.superproxy.io + IA adaptativa + 8 UA pool
-// Categorias: Order | Product | Logistics | Shop | Finance | Promotion |
-//             Analytics | Returns | Label | Voucher | Account | Chat |
-//             Fulfillment | Inventory | Category | Rating | Search | Recommend
-
 const http    = require('http');
 const https   = require('https');
 const url_mod = require('url');
