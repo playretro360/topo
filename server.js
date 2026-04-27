@@ -2566,39 +2566,128 @@ http.createServer(async (req, res) => {
   // ══════════════════════════════════════════════════════════════════════════
   if (req.method === 'POST' && p === '/buyer-discover') {
     const d = await readBody();
-    if (!BD_WSS) {
+    if (!BD_WSS && !getResidentialProxy()) {
       res.writeHead(503);
-      return res.end(JSON.stringify({ ok: false, error: 'BD_WSS nao configurado' }));
+      return res.end(JSON.stringify({ ok: false, error: 'BD_WSS ou Residential nao configurado' }));
     }
-    try {
-      const r = await discoverViaBrowser({
-        category_id: d.category_id,
-        keyword: d.keyword,
-        sort: d.sort || 'sales',
-        limit: Math.min(d.limit || 60, 100),
-        offset: d.offset || 0,
-      });
-      if (r.items && r.items.length > 0) {
-        res.writeHead(200);
+    
+    let browserResult = null;
+    let browserErr = null;
+    
+    // 1ª tentativa: Scraping Browser (CDP) — funciona melhor pra recommend
+    if (BD_WSS && !d.skip_browser) {
+      try {
+        browserResult = await discoverViaBrowser({
+          category_id: d.category_id,
+          keyword: d.keyword,
+          sort: d.sort || 'sales',
+          limit: Math.min(d.limit || 60, 100),
+          offset: d.offset || 0,
+        });
+        if (browserResult.items && browserResult.items.length > 0) {
+          res.writeHead(200);
+          return res.end(JSON.stringify({
+            ok: true,
+            items: browserResult.items,
+            total: browserResult.items.length,
+            source: 'browser_' + (browserResult.source || 'unknown'),
+          }));
+        }
+      } catch(e) {
+        browserErr = e.message;
+      }
+    }
+    
+    // 2ª tentativa: Residential Proxy direto na API v4 (IP brasileiro real, sem browser)
+    if (getResidentialProxy()) {
+      try {
+        const sort = d.sort || 'sales';
+        const byMap = { sales: 'sales', pop: 'pop', latest: 'ctime', price_asc: 'price', price_desc: 'price' };
+        const by = byMap[sort] || 'sales';
+        const order = sort === 'price_asc' ? 'asc' : 'desc';
+        const limit = Math.min(d.limit || 60, 100);
+        const offset = d.offset || 0;
+        
+        let apiUrl;
+        if (d.category_id) {
+          apiUrl = `https://shopee.com.br/api/v4/search/search_items?by=${by}&limit=${limit}&newest=${offset}&order=${order}&page_type=search&scenario=PAGE_CATEGORY&match_id=${d.category_id}&version=2`;
+        } else if (d.keyword) {
+          apiUrl = `https://shopee.com.br/api/v4/search/search_items?by=${by}&keyword=${encodeURIComponent(d.keyword)}&limit=${limit}&newest=${offset}&order=${order}&page_type=search&scenario=PAGE_GLOBAL_SEARCH&version=2`;
+        } else {
+          apiUrl = `https://shopee.com.br/api/v4/recommend/recommend?bundle=daily_discover&limit=${limit}&offset=${offset}`;
+        }
+        
+        const resi = await residentialReq({
+          url: apiUrl,
+          method: 'GET',
+          headers: {
+            'User-Agent': rnd(UA_DESKTOP),
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+            'Referer': 'https://shopee.com.br/',
+            'X-Api-Source': 'pc',
+            'X-Shopee-Language': 'pt-BR',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Cache-Control': 'no-cache',
+          },
+        });
+        
+        if (resi.status === 200 && resi.data) {
+          // Normalizar items: API search vs recommend retornam shapes diferentes
+          let items = [];
+          if (Array.isArray(resi.data.items)) {
+            // search_items: cada item tem item_basic
+            items = resi.data.items.map(it => it.item_basic || it).filter(it => it && it.itemid);
+          } else if (resi.data.data?.sections) {
+            // recommend: data.sections[].data.item.item_basic
+            for (const sec of resi.data.data.sections) {
+              const secItems = (sec?.data?.item || []).map(it => it.item_basic || it).filter(it => it?.itemid);
+              items.push(...secItems);
+            }
+          }
+          
+          if (items.length > 0) {
+            res.writeHead(200);
+            return res.end(JSON.stringify({
+              ok: true,
+              items,
+              total: items.length,
+              source: 'residential_api_v4',
+            }));
+          }
+        }
+        
+        // Residential também vazio → retorna 503 com debug
+        res.writeHead(503);
         return res.end(JSON.stringify({
-          ok: true,
-          items: r.items,
-          total: r.items.length,
-          source: r.source,
+          ok: false,
+          error: 'Nenhum produto encontrado (browser e residential vazios)',
+          items: [],
+          debug_browser_err: browserErr,
+          debug_browser_previews: browserResult?.previews || [],
+          debug_residential: { status: resi.status, data_keys: Object.keys(resi.data || {}), raw_preview: (resi.raw || '').slice(0, 500) },
+        }));
+      } catch(e) {
+        res.writeHead(503);
+        return res.end(JSON.stringify({
+          ok: false,
+          error: 'browser+residential falharam',
+          items: [],
+          debug_browser_err: browserErr,
+          debug_residential_err: e.message,
         }));
       }
-      res.writeHead(503);
-      return res.end(JSON.stringify({
-        ok: false,
-        error: 'Nenhum produto encontrado',
-        items: [],
-        debug_errors: r.errors || [],
-        debug_previews: r.previews || [],
-      }));
-    } catch(e) {
-      res.writeHead(500);
-      return res.end(JSON.stringify({ ok: false, error: e.message, items: [] }));
     }
+    
+    // Sem Residential disponível, retorna o que browser deu
+    res.writeHead(503);
+    return res.end(JSON.stringify({
+      ok: false,
+      error: 'Nenhum produto encontrado',
+      items: [],
+      debug_errors: browserResult?.errors || [],
+      debug_previews: browserResult?.previews || [],
+    }));
   }
 
   if (req.method === 'POST' && p === '/search-public') {
@@ -2675,13 +2764,16 @@ http.createServer(async (req, res) => {
         'Origin': 'https://shopee.com.br',
         ...(d.headers||{}),
       };
-      // Usa proxy residencial se disponível, senão usa BD proxy (browser zone)
-      const useUnlocker = !!getUnlockerKey();
-      const useResidential = !useUnlocker && !!getResidentialProxy();
+      // Web Unlocker bloqueia Shopee /api/v4/*. Pra esse path, força Residential Proxy.
+      // Cliente também pode forçar via use_residential:true no body.
+      const isShopeeApi = /shopee\.com(?:\.br)?\/api\/v\d+/i.test(d.url);
+      const forceResidential = !!d.use_residential || isShopeeApi;
+      const useUnlocker = !forceResidential && !!getUnlockerKey();
+      const useResidential = forceResidential ? !!getResidentialProxy() : (!useUnlocker && !!getResidentialProxy());
       const proxyFn = useUnlocker ? (o) => unlockerReq(o.url) : (useResidential ? residentialReq : proxyReq);
       const proxyResp = await proxyFn({ url: d.url, method: d.method||'GET', headers: hdrs }, d.body||undefined);
       res.writeHead(proxyResp.status);
-      return res.end(JSON.stringify({ status: proxyResp.status, data: proxyResp.data, raw: proxyResp.raw?.slice(0, d.max_len || 2000) }));
+      return res.end(JSON.stringify({ status: proxyResp.status, data: proxyResp.data, raw: proxyResp.raw?.slice(0, d.max_len || 2000), used: useUnlocker?'unlocker':(useResidential?'residential':'proxy') }));
     } catch(e) {
       res.writeHead(500);
       return res.end(JSON.stringify({ error: e.message }));
