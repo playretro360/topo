@@ -2428,9 +2428,22 @@ async function discoverViaHtmlDom({ url, limit = 60, scrolls = 2 } = {}) {
           const card = c.card;
 
           const img = card.querySelector('img');
-          const image = img?.src || img?.dataset?.src || img?.dataset?.original || '';
-          const imgHashMatch = image.match(/\\/file\\/([a-f0-9_]+)/);
-          const imageHash = imgHashMatch ? imgHashMatch[1] : '';
+          // Priorizar src da imagem do produto (Shopee CDN: down-br.img.susercontent.com ou deo.shopeemobile.com)
+          let image = '';
+          const allImgs = card.querySelectorAll('img');
+          for (const im of allImgs) {
+            const src = im.src || im.dataset?.src || im.dataset?.original || '';
+            if (src.includes('susercontent.com') || src.includes('shopeemobile.com')) {
+              image = src;
+              break;
+            }
+          }
+          if (!image && img) image = img.src || '';
+          
+          // Extrair hash da CDN URL (formato: /file/HASH ou /file/HASH_tn)
+          let imageHash = '';
+          const imgHashMatch = image.match(/\\/file\\/([a-f0-9]{16,}(?:_tn)?)/);
+          if (imgHashMatch) imageHash = imgHashMatch[1].replace(/_tn$/, '');
 
           // Nome: prioridade alt > título adjacente > primeiro texto longo
           let name = (img?.alt || '').trim();
@@ -2441,6 +2454,7 @@ async function discoverViaHtmlDom({ url, limit = 60, scrolls = 2 } = {}) {
           }
 
           const txt = card.textContent || '';
+          // Preço — formato Shopee BR: R$21,90 ou R$1.234,56
           const priceMatch = txt.match(/R\\$\\s*([\\d.]+,?\\d*)/);
           let priceCents = 0;
           if (priceMatch) {
@@ -2448,9 +2462,9 @@ async function discoverViaHtmlDom({ url, limit = 60, scrolls = 2 } = {}) {
             priceCents = Math.round(parseFloat(numStr) * 100);
           }
 
+          // Sold — Shopee BR atual NÃO mostra na busca; só aparece em flash sale
           let sold = 0;
-          const soldMatch = txt.match(/(\\d+(?:[.,]\\d+)?(?:\\s*[mk])?)\\s*vendidos?/i) ||
-                            txt.match(/(\\d+(?:[.,]\\d+)?\\s*mil)\\s+vendidos?/i);
+          const soldMatch = txt.match(/(\\d+(?:[.,]\\d+)?(?:\\s*[mk])?)\\s*vendidos?/i);
           if (soldMatch) {
             let s = soldMatch[1].toLowerCase().replace(',', '.');
             const mul = s.includes('mil') ? 1000 : (s.endsWith('k') ? 1000 : (s.endsWith('m') ? 1000000 : 1));
@@ -2458,23 +2472,42 @@ async function discoverViaHtmlDom({ url, limit = 60, scrolls = 2 } = {}) {
             sold = Math.round(parseFloat(s) * mul);
           }
 
+          // Rating — tipo "4.4", "4.6" geralmente após desconto
+          // Padrão na Shopee BR: R$XX,XX[no Pix][-NN%]4.6São Paulo
           let rating = 0;
-          const rm = txt.match(/(\\d[.,]\\d)\\s*estrelas?|★\\s*(\\d[.,]\\d)/);
-          if (rm) rating = parseFloat((rm[1]||rm[2]).replace(',','.'));
+          const ratingMatch = txt.match(/(?:%|R\\$[\\d.,]+(?:no Pix)?)\\s*(\\d[.,]\\d)\\s*(?:[A-ZÀ-Ú]|$)/) ||
+                              txt.match(/(\\d[.,]\\d)\\s*estrelas?/i) ||
+                              txt.match(/★\\s*(\\d[.,]\\d)/);
+          if (ratingMatch) {
+            const r = parseFloat(ratingMatch[1].replace(',','.'));
+            if (r >= 1 && r <= 5) rating = r;
+          }
+
+          // Discount % — formato "-27%" ou "-N%"
+          let discountPct = 0;
+          const discMatch = txt.match(/-(\\d{1,2})%/);
+          if (discMatch) discountPct = parseInt(discMatch[1]);
 
           let shopLocation = '';
           const locMatch = txt.match(/(São Paulo|Rio de Janeiro|Minas Gerais|Paraná|Bahia|Pernambuco|Goiás|Ceará|Santa Catarina|Rio Grande do Sul|Espírito Santo|Distrito Federal|Mato Grosso|[A-ZÀ-Ú][a-zà-ú]+\\s*\\([A-Z]{2}\\))/);
           if (locMatch) shopLocation = locMatch[0];
 
           if (priceCents > 0) {
+            // Se teve desconto, calcular preço original
+            let origPriceMicros = null;
+            if (discountPct > 0 && discountPct < 100) {
+              origPriceMicros = Math.round(priceCents * 1000 / (1 - discountPct/100));
+            }
             items.push({
               itemid: c.itemid,
               shopid: c.shopid,
               catid: c.catid || '',
               name: name || ('Item ' + c.itemid),
-              image: imageHash || image,
+              image: imageHash || image, // hash sem URL completa, ou URL inteira como fallback
               price: priceCents * 1000,
               price_min: priceCents * 1000,
+              price_before_discount: origPriceMicros,
+              raw_discount: discountPct,
               historical_sold: sold,
               sold: sold,
               item_rating: { rating_star: rating, rating_count: [0,0,0,0,0,0] },
