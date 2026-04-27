@@ -2155,15 +2155,36 @@ async function discoverViaBrowser({ category_id, keyword, sort = 'sales', limit 
     await s.send('Page.enable', {}).catch(()=>{});
     await s.send('Network.enable', {}).catch(()=>{});
 
-    // Navegar pra shopee.com.br pra estabelecer contexto
-    await s.send('Page.navigate', { url: 'https://shopee.com.br/' });
-    // Aguardar 3s pro JS context inicializar (não precisa do page load completo)
-    await new Promise(r => setTimeout(r, 3000));
-
     // Map de sort → 'by' param
     const byMap = { sales: 'sales', pop: 'pop', latest: 'ctime', price_asc: 'price', price_desc: 'price' };
     const by = byMap[sort] || 'sales';
     const order = sort === 'price_asc' ? 'asc' : 'desc';
+
+    // 1) Warmup — navegar pra URL HTML real pra Shopee setar cookies de sessão
+    let warmupUrl;
+    if (category_id) {
+      warmupUrl = `https://shopee.com.br/Mais-Vendidos-cat.${category_id}`;
+    } else if (keyword) {
+      warmupUrl = `https://shopee.com.br/buscar?keyword=${encodeURIComponent(keyword)}&sortBy=${by === 'ctime' ? 'ctime' : 'sales'}&order=${order}`;
+    } else {
+      warmupUrl = 'https://shopee.com.br/';
+    }
+    
+    try {
+      await s.send('Page.navigate', { url: warmupUrl });
+    } catch(e) {
+      // ignore — pode dar erro de timeout em loads pesados
+    }
+    // Espera longa pra Shopee carregar JS, setar SPC_SI, SPC_F, csrftoken etc
+    await new Promise(r => setTimeout(r, 6000));
+    
+    // 2) Pegar csrftoken do cookie pra mandar nos headers
+    let csrftoken = '';
+    try {
+      const cookieResult = await s.send('Network.getCookies', { urls: ['https://shopee.com.br'] });
+      const csrf = (cookieResult.cookies || []).find(c => c.name === 'csrftoken');
+      if (csrf) csrftoken = csrf.value;
+    } catch(e) {}
 
     // 4 estratégias na ordem (cai pro fallback se vier vazio)
     const urls = [];
@@ -2174,7 +2195,6 @@ async function discoverViaBrowser({ category_id, keyword, sort = 'sales', limit 
       urls.push(`https://shopee.com.br/api/v4/search/search_items?by=${by}&keyword=${encodeURIComponent(keyword)}&limit=${limit}&newest=${offset}&order=${order}&page_type=search&scenario=PAGE_GLOBAL_SEARCH&version=2`);
     }
     if (!category_id && !keyword) {
-      // Sem categoria/keyword: pega trending direto
       urls.push(`https://shopee.com.br/api/v4/recommend/recommend?bundle=daily_discover&limit=${limit}&offset=${offset}`);
       urls.push(`https://shopee.com.br/api/v4/recommend/recommend?bundle=popular_items&item_card=2&limit=${limit}&offset=${offset}`);
       urls.push(`https://shopee.com.br/api/v4/flash_sale/get_all_itm?category_id=0&limit=${limit}&offset=${offset}`);
@@ -2184,8 +2204,28 @@ async function discoverViaBrowser({ category_id, keyword, sort = 'sales', limit 
     const previews = [];
     for (const targetUrl of urls) {
       try {
+        const fetchExpr = `(async()=>{
+          try {
+            const r = await fetch(${JSON.stringify(targetUrl)}, {
+              credentials: 'include',
+              headers: {
+                'Accept': 'application/json',
+                'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+                'x-api-source': 'pc',
+                'x-shopee-language': 'pt-BR',
+                'af-ac-enc-dat': 'a',
+                'Referer': ${JSON.stringify(warmupUrl)},
+                ${csrftoken ? `'x-csrftoken': ${JSON.stringify(csrftoken)},` : ''}
+              }
+            });
+            const txt = await r.text();
+            return JSON.stringify({ status: r.status, body: txt.slice(0, 5000) });
+          } catch(e) {
+            return JSON.stringify({ err: String(e.message || e) });
+          }
+        })()`;
         const result = await s.send('Runtime.evaluate', {
-          expression: `(async()=>{try{const r=await fetch(${JSON.stringify(targetUrl)},{credentials:'include',headers:{'Accept':'application/json','x-api-source':'pc','Referer':'https://shopee.com.br/'}});const txt=await r.text();return JSON.stringify({status:r.status,body:txt.slice(0,2000)});}catch(e){return JSON.stringify({err:String(e.message||e)});}})()`,
+          expression: fetchExpr,
           awaitPromise: true,
           timeout: 20000,
         });
