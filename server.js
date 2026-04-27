@@ -3036,6 +3036,7 @@ http.createServer(async (req, res) => {
           total: r.items.length,
           source: r.source,
           url: target,
+          debug: r.debug,
         }));
       }
       
