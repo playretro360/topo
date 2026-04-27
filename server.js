@@ -2127,6 +2127,91 @@ async function searchViaBrowser(shopid, limit, offset, cookies) {
 
 
 // ══════════════════════════════════════════════════════════════════════════
+// discoverViaBrowser — Descobre produtos top da Shopee BR via Scraping Browser
+// Acessa /api/v4/* dentro do contexto da página (bypassa anti-bot por origin)
+// Sem precisar de cookies de seller. Usa categoria, keyword, ou recommend.
+// ══════════════════════════════════════════════════════════════════════════
+async function discoverViaBrowser({ category_id, keyword, sort = 'sales', limit = 60, offset = 0 } = {}) {
+  if (!BD_WSS) throw new Error('BD_WSS nao configurado');
+
+  const ws = new WebSocket(BD_WSS, { handshakeTimeout: 20000 });
+  await new Promise((resolve, reject) => {
+    ws.once('open', resolve);
+    ws.once('error', reject);
+    setTimeout(() => reject(new Error('WS timeout')), 20000);
+  });
+  const cdp = new CDPBrowser(ws);
+
+  try {
+    const newTarget = await cdp.send('Target.createTarget', {
+      url: 'https://shopee.com.br/',
+      newWindow: false,
+      background: true,
+    });
+    const newTargetId = newTarget.targetId;
+    const { sessionId: sid2 } = await cdp.send('Target.attachToTarget', { targetId: newTargetId, flatten: true });
+    const s = cdp.session(sid2);
+    await s.send('Network.enable', {}).catch(()=>{});
+
+    // 1s pro JS context inicializar
+    await new Promise(r => setTimeout(r, 1000));
+
+    // Map de sort → 'by' param
+    const byMap = { sales: 'sales', pop: 'pop', latest: 'ctime', price_asc: 'price', price_desc: 'price' };
+    const by = byMap[sort] || 'sales';
+    const order = sort === 'price_asc' ? 'asc' : 'desc';
+
+    // 4 estratégias na ordem (cai pro fallback se vier vazio)
+    const urls = [];
+    if (category_id) {
+      urls.push(`https://shopee.com.br/api/v4/search/search_items?by=${by}&limit=${limit}&newest=${offset}&order=${order}&page_type=search&scenario=PAGE_CATEGORY&match_id=${category_id}&version=2`);
+    }
+    if (keyword) {
+      urls.push(`https://shopee.com.br/api/v4/search/search_items?by=${by}&keyword=${encodeURIComponent(keyword)}&limit=${limit}&newest=${offset}&order=${order}&page_type=search&scenario=PAGE_GLOBAL_SEARCH&version=2`);
+    }
+    if (!category_id && !keyword) {
+      // Sem categoria/keyword: pega trending direto
+      urls.push(`https://shopee.com.br/api/v4/recommend/recommend?bundle=daily_discover&limit=${limit}&offset=${offset}`);
+      urls.push(`https://shopee.com.br/api/v4/recommend/recommend?bundle=popular_items&item_card=2&limit=${limit}&offset=${offset}`);
+      urls.push(`https://shopee.com.br/api/v4/flash_sale/get_all_itm?category_id=0&limit=${limit}&offset=${offset}`);
+    }
+
+    const errors = [];
+    for (const targetUrl of urls) {
+      try {
+        const result = await s.send('Runtime.evaluate', {
+          expression: `(async()=>{const r=await fetch(${JSON.stringify(targetUrl)},{credentials:'include',headers:{'Accept':'application/json','x-api-source':'pc','Referer':'https://shopee.com.br/'}});const d=await r.json();return JSON.stringify(d);})()`,
+          awaitPromise: true,
+          timeout: 15000,
+        });
+        const data = JSON.parse(result.result?.value || '{}');
+        let items = data.items || [];
+        if (!items.length) {
+          const sec = data?.data?.sections?.[0]?.data;
+          if (sec?.item?.length) items = sec.item;
+        }
+        if (!items.length) {
+          const dd = data?.data || {};
+          items = dd.items || dd.item_list || dd.item || [];
+        }
+        if (items.length > 0) {
+          cdp.close();
+          return { items, source: targetUrl.includes('/search/') ? 'search' : (targetUrl.includes('/recommend/') ? 'recommend' : 'flash_sale') };
+        }
+      } catch(e) {
+        errors.push(e.message?.slice(0, 80));
+      }
+    }
+    cdp.close();
+    return { items: [], source: 'none', errors };
+  } catch(e) {
+    cdp.close();
+    throw e;
+  }
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════
 // buyerActionViaBrowser — Faz POST/GET autenticado em endpoint Shopee API
 // usando Browser CDP (browser real via Bright Data Scraping Browser).
 // Bypassa anti-bot, captcha simples e validações de origin.
@@ -2413,6 +2498,51 @@ http.createServer(async (req, res) => {
       res.writeHead(r.ok?200:r.expired?401:500);
       return res.end(JSON.stringify(r));
     } catch(e) { res.writeHead(500); return res.end(JSON.stringify({ error: e.message })); }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // /buyer-discover — Discovery de produtos top da Shopee BR
+  // Sem precisar de cookies/seller. Usa Bright Data Scraping Browser.
+  // Body: { category_id?, keyword?, sort?, limit?, offset? }
+  //   sort: 'sales' (default) | 'pop' | 'latest' | 'price_asc' | 'price_desc'
+  //   limit: default 60, max ~100
+  //   category_id: catid Shopee BR (ex: 11013295)
+  //   keyword: busca textual
+  // ══════════════════════════════════════════════════════════════════════════
+  if (req.method === 'POST' && p === '/buyer-discover') {
+    const d = await readBody();
+    if (!BD_WSS) {
+      res.writeHead(503);
+      return res.end(JSON.stringify({ ok: false, error: 'BD_WSS nao configurado' }));
+    }
+    try {
+      const r = await discoverViaBrowser({
+        category_id: d.category_id,
+        keyword: d.keyword,
+        sort: d.sort || 'sales',
+        limit: Math.min(d.limit || 60, 100),
+        offset: d.offset || 0,
+      });
+      if (r.items && r.items.length > 0) {
+        res.writeHead(200);
+        return res.end(JSON.stringify({
+          ok: true,
+          items: r.items,
+          total: r.items.length,
+          source: r.source,
+        }));
+      }
+      res.writeHead(503);
+      return res.end(JSON.stringify({
+        ok: false,
+        error: 'Nenhum produto encontrado',
+        items: [],
+        debug_errors: r.errors || [],
+      }));
+    } catch(e) {
+      res.writeHead(500);
+      return res.end(JSON.stringify({ ok: false, error: e.message, items: [] }));
+    }
   }
 
   if (req.method === 'POST' && p === '/search-public') {
