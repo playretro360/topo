@@ -2331,16 +2331,31 @@ async function discoverViaHtmlDom({ url, limit = 60, scrolls = 2 } = {}) {
     } catch(e) {}
     await new Promise(r => setTimeout(r, 1500));
 
-    // Extrair produtos do DOM
+    // Extrair produtos do DOM (+ debug info pra diagnosticar bloqueios)
     const extractExpr = `(()=>{
       try {
-        // 1) Tentar extrair de window.__INITIAL_STATE__ / __APP_DATA__ (SSR data)
+        const debug = {
+          title: document.title,
+          url: location.href,
+          body_len: (document.body?.innerText || '').length,
+          body_preview: (document.body?.innerText || '').slice(0, 500),
+          html_preview: (document.documentElement?.outerHTML || '').slice(0, 1500),
+          links_total: document.querySelectorAll('a').length,
+          links_iSx: document.querySelectorAll('a[href*=".i."]').length,
+          links_product: document.querySelectorAll('a[href*="/product/"]').length,
+          imgs_total: document.querySelectorAll('img').length,
+          window_keys: Object.keys(window).filter(k => k.startsWith('__') || k.includes('hopee') || k.includes('NEXT') || k.includes('NUXT')).slice(0, 20),
+          has_captcha: !!document.querySelector('[class*="captcha" i],[class*="challenge" i],iframe[src*="captcha"]'),
+          ready_state: document.readyState,
+        };
+
+        // 1) Tentar extrair de window.__INITIAL_STATE__ etc
         const stateKeys = ['__INITIAL_STATE__','__APP_DATA__','__NUXT__','__NEXT_DATA__','__INITIAL_DATA__'];
         for (const k of stateKeys) {
           if (window[k]) {
             try {
               const j = typeof window[k] === 'string' ? JSON.parse(window[k]) : window[k];
-              return JSON.stringify({ source: 'window.' + k, state: j });
+              return JSON.stringify({ source: 'window.' + k, state_keys: Object.keys(j||{}).slice(0,30), items: [], debug });
             } catch(e) {}
           }
         }
@@ -2359,30 +2374,24 @@ async function discoverViaHtmlDom({ url, limit = 60, scrolls = 2 } = {}) {
           if (seen.has(key)) continue;
           seen.add(key);
 
-          // Tentar pegar o card (parent ancestral mais útil)
           let card = a;
           for (let p = a; p && p !== document.body; p = p.parentElement) {
             const txt = (p.textContent || '').trim();
             if (txt.length > 20 && txt.length < 600) { card = p; break; }
           }
 
-          // Imagem
           const img = card.querySelector('img');
           const image = img?.src || img?.dataset?.src || img?.dataset?.original || '';
-          // Pra Shopee CDN: extrair só o hash
           const imgHashMatch = image.match(/\\/file\\/([a-f0-9_]+)/);
           const imageHash = imgHashMatch ? imgHashMatch[1] : '';
 
-          // Nome: alt do img, ou primeiro texto longo
           let name = (img?.alt || '').trim();
           if (!name) {
-            // Pegar o texto do card sem moeda/preço
             const fullText = (card.textContent || '').trim().replace(/\\s+/g, ' ');
             const stripped = fullText.replace(/R\\$\\s*[\\d.,]+/g, '').replace(/\\d+\\s*vendidos?/gi, '').replace(/[\\d,.]+\\s*estrelas?/gi, '').trim();
             name = stripped.slice(0, 200);
           }
 
-          // Preço: regex no texto do card
           const txt = card.textContent || '';
           const priceMatch = txt.match(/R\\$\\s*([\\d.]+,?\\d*)/);
           let priceCents = 0;
@@ -2391,7 +2400,6 @@ async function discoverViaHtmlDom({ url, limit = 60, scrolls = 2 } = {}) {
             priceCents = Math.round(parseFloat(numStr) * 100);
           }
 
-          // Sold: regex
           let sold = 0;
           const soldMatch = txt.match(/(\\d+(?:[.,]\\d+)?(?:\\s*[mk])?)\\s*vendidos?/i);
           if (soldMatch) {
@@ -2401,12 +2409,10 @@ async function discoverViaHtmlDom({ url, limit = 60, scrolls = 2 } = {}) {
             sold = Math.round(parseFloat(s) * mul);
           }
 
-          // Rating
           let rating = 0;
           const rm = txt.match(/(\\d[.,]\\d)\\s*estrelas?|★\\s*(\\d[.,]\\d)/);
           if (rm) rating = parseFloat((rm[1]||rm[2]).replace(',','.'));
 
-          // shop_location (cidade/estado)
           let shopLocation = '';
           const locMatch = txt.match(/(São Paulo|Rio de Janeiro|Minas Gerais|Paraná|Bahia|Pernambuco|Goiás|Ceará|Santa Catarina|Rio Grande do Sul|Espírito Santo|Distrito Federal|Mato Grosso|[A-ZÀ-Ú][a-zà-ú]+\\s*\\([A-Z]{2}\\))/);
           if (locMatch) shopLocation = locMatch[0];
@@ -2417,21 +2423,21 @@ async function discoverViaHtmlDom({ url, limit = 60, scrolls = 2 } = {}) {
               shopid: shopid,
               name: name,
               image: imageHash || image,
-              price: priceCents * 1000, // convert cents → "micros" pra bater com formato API Shopee
+              price: priceCents * 1000,
               price_min: priceCents * 1000,
               historical_sold: sold,
               sold: sold,
               item_rating: { rating_star: rating, rating_count: [0,0,0,0,0,0] },
               shop_location: shopLocation,
               shop_name: shopLocation,
-              stock: 99, // placeholder
+              stock: 99,
               liked_count: 0,
               view_count: 0,
               source_html: true,
             });
           }
         }
-        return JSON.stringify({ source: 'dom_scrape', items });
+        return JSON.stringify({ source: 'dom_scrape', items, debug });
       } catch(e) {
         return JSON.stringify({ error: String(e.message || e), source: 'dom_scrape_err' });
       }
