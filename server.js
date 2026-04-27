@@ -2181,14 +2181,25 @@ async function discoverViaBrowser({ category_id, keyword, sort = 'sales', limit 
     }
 
     const errors = [];
+    const previews = [];
     for (const targetUrl of urls) {
       try {
         const result = await s.send('Runtime.evaluate', {
-          expression: `(async()=>{const r=await fetch(${JSON.stringify(targetUrl)},{credentials:'include',headers:{'Accept':'application/json','x-api-source':'pc','Referer':'https://shopee.com.br/'}});const d=await r.json();return JSON.stringify(d);})()`,
+          expression: `(async()=>{try{const r=await fetch(${JSON.stringify(targetUrl)},{credentials:'include',headers:{'Accept':'application/json','x-api-source':'pc','Referer':'https://shopee.com.br/'}});const txt=await r.text();return JSON.stringify({status:r.status,body:txt.slice(0,2000)});}catch(e){return JSON.stringify({err:String(e.message||e)});}})()`,
           awaitPromise: true,
-          timeout: 15000,
+          timeout: 20000,
         });
-        const data = JSON.parse(result.result?.value || '{}');
+        const wrapped = JSON.parse(result.result?.value || '{}');
+        if (wrapped.err) {
+          errors.push({ url: targetUrl.slice(0, 80), fetch_err: wrapped.err });
+          continue;
+        }
+        const httpStatus = wrapped.status;
+        const bodyText = wrapped.body || '';
+        let data = {};
+        try { data = JSON.parse(bodyText); } catch {}
+        previews.push({ url: targetUrl.slice(0, 80), status: httpStatus, preview: bodyText.slice(0, 200) });
+
         let items = data.items || [];
         if (!items.length) {
           const sec = data?.data?.sections?.[0]?.data;
@@ -2203,11 +2214,11 @@ async function discoverViaBrowser({ category_id, keyword, sort = 'sales', limit 
           return { items, source: targetUrl.includes('/search/') ? 'search' : (targetUrl.includes('/recommend/') ? 'recommend' : 'flash_sale') };
         }
       } catch(e) {
-        errors.push(e.message?.slice(0, 80));
+        errors.push({ url: targetUrl.slice(0, 80), exc: String(e.message || e).slice(0, 200) });
       }
     }
     cdp.close();
-    return { items: [], source: 'none', errors };
+    return { items: [], source: 'none', errors, previews };
   } catch(e) {
     cdp.close();
     throw e;
@@ -2542,6 +2553,7 @@ http.createServer(async (req, res) => {
         error: 'Nenhum produto encontrado',
         items: [],
         debug_errors: r.errors || [],
+        debug_previews: r.previews || [],
       }));
     } catch(e) {
       res.writeHead(500);
