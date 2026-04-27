@@ -2347,6 +2347,8 @@ async function discoverViaHtmlDom({ url, limit = 60, scrolls = 2 } = {}) {
           window_keys: Object.keys(window).filter(k => k.startsWith('__') || k.includes('hopee') || k.includes('NEXT') || k.includes('NUXT')).slice(0, 20),
           has_captcha: !!document.querySelector('[class*="captcha" i],[class*="challenge" i],iframe[src*="captcha"]'),
           ready_state: document.readyState,
+          // Dump samples de links pra entender formato da URL produto na Shopee atual
+          link_samples: Array.from(document.querySelectorAll('a[href]')).slice(0, 40).map(a => a.getAttribute('href')).filter(h => h && h.length > 5 && h.length < 250),
         };
 
         // 1) Tentar extrair de window.__INITIAL_STATE__ etc
