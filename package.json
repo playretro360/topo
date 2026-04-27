@@ -1,11 +1,11 @@
 {
   "name": "topo",
   "version": "14.1.0",
-  "description": "Vendry Sync Server — Bright Data bridge para Shopee Brasil",
-  "main": "index.js",
+  "description": "Vendry Sync Server — Bright Data bridge para Shopee Brasil (geo-targeting BR forçado)",
+  "main": "server.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node index.js"
+    "start": "node server.js",
+    "dev": "node server.js"
   },
   "dependencies": {
     "ws": "^8.18.0"
