@@ -2362,35 +2362,66 @@ async function discoverViaHtmlDom({ url, limit = 60, scrolls = 2 } = {}) {
           }
         }
 
-        // 2) DOM scraping: links com pattern /xxxx-i.SHOPID.ITEMID
-        const links = Array.from(document.querySelectorAll('a[href*=".i."]'));
-        const seen = new Set();
-        const items = [];
-        for (const a of links) {
-          if (items.length >= ${limit}) break;
+        // 2) DOM scraping: detectar produtos via QUALQUER link com itemid+shopid
+        // Pattern moderno Shopee BR: /find_similar_products?catid=X&itemid=Y&shopid=Z
+        // Pattern legado: /xxxx-i.SHOPID.ITEMID
+        // Vamos coletar TODOS os pares (itemid, shopid) e juntar com info do card pai
+        const allLinks = Array.from(document.querySelectorAll('a[href]'));
+        const candidates = []; // {el, itemid, shopid, catid}
+        for (const a of allLinks) {
           const href = a.getAttribute('href') || '';
-          const m = href.match(/i\\.(\\d+)\\.(\\d+)/);
-          if (!m) continue;
-          const shopid = m[1], itemid = m[2];
-          const key = shopid + ':' + itemid;
-          if (seen.has(key)) continue;
-          seen.add(key);
-
-          let card = a;
-          for (let p = a; p && p !== document.body; p = p.parentElement) {
-            const txt = (p.textContent || '').trim();
-            if (txt.length > 20 && txt.length < 600) { card = p; break; }
+          // Padrão A: ?itemid=...&shopid=...
+          const qsMatch = href.match(/[?&]itemid=(\\d+)[^&]*&shopid=(\\d+)/) || href.match(/[?&]shopid=(\\d+)[^&]*&itemid=(\\d+)/);
+          if (qsMatch) {
+            const [itemid, shopid] = href.indexOf('itemid=') < href.indexOf('shopid=') ? [qsMatch[1], qsMatch[2]] : [qsMatch[2], qsMatch[1]];
+            const catMatch = href.match(/[?&]catid=(\\d+)/);
+            candidates.push({ el: a, itemid, shopid, catid: catMatch ? catMatch[1] : '' });
+            continue;
           }
+          // Padrão B legado: i.SHOPID.ITEMID
+          const legacyMatch = href.match(/i\\.(\\d+)\\.(\\d+)/);
+          if (legacyMatch) {
+            candidates.push({ el: a, itemid: legacyMatch[2], shopid: legacyMatch[1], catid: '' });
+          }
+        }
+
+        // Para cada (itemid, shopid), pegar o card visual mais próximo
+        // Itemids podem aparecer múltiplas vezes (link "ver similares" + link do produto)
+        // Agrupar por chave única
+        const byKey = new Map();
+        for (const c of candidates) {
+          const key = c.shopid + ':' + c.itemid;
+          // Cada candidato pode contribuir com o card pai
+          let card = c.el;
+          for (let p = c.el; p && p !== document.body; p = p.parentElement) {
+            const txt = (p.textContent || '').trim();
+            if (txt.length > 30 && txt.length < 1000 && (p.querySelector('img') || /R\\$\\s*\\d/.test(txt))) {
+              card = p;
+              break;
+            }
+          }
+          // Mantém o card maior se já existe
+          const existing = byKey.get(key);
+          if (!existing || (card.textContent || '').length > (existing.card.textContent || '').length) {
+            byKey.set(key, { ...c, card });
+          }
+        }
+
+        const items = [];
+        for (const [key, c] of byKey) {
+          if (items.length >= ${limit}) break;
+          const card = c.card;
 
           const img = card.querySelector('img');
           const image = img?.src || img?.dataset?.src || img?.dataset?.original || '';
           const imgHashMatch = image.match(/\\/file\\/([a-f0-9_]+)/);
           const imageHash = imgHashMatch ? imgHashMatch[1] : '';
 
+          // Nome: prioridade alt > título adjacente > primeiro texto longo
           let name = (img?.alt || '').trim();
           if (!name) {
             const fullText = (card.textContent || '').trim().replace(/\\s+/g, ' ');
-            const stripped = fullText.replace(/R\\$\\s*[\\d.,]+/g, '').replace(/\\d+\\s*vendidos?/gi, '').replace(/[\\d,.]+\\s*estrelas?/gi, '').trim();
+            const stripped = fullText.replace(/R\\$\\s*[\\d.,]+/g, '').replace(/\\d+\\s*vendidos?/gi, '').replace(/[\\d,.]+\\s*estrelas?/gi, '').replace(/Frete grátis?/gi, '').replace(/-\\s*\\d+%/g, '').trim();
             name = stripped.slice(0, 200);
           }
 
@@ -2403,11 +2434,12 @@ async function discoverViaHtmlDom({ url, limit = 60, scrolls = 2 } = {}) {
           }
 
           let sold = 0;
-          const soldMatch = txt.match(/(\\d+(?:[.,]\\d+)?(?:\\s*[mk])?)\\s*vendidos?/i);
+          const soldMatch = txt.match(/(\\d+(?:[.,]\\d+)?(?:\\s*[mk])?)\\s*vendidos?/i) ||
+                            txt.match(/(\\d+(?:[.,]\\d+)?\\s*mil)\\s+vendidos?/i);
           if (soldMatch) {
             let s = soldMatch[1].toLowerCase().replace(',', '.');
             const mul = s.includes('mil') ? 1000 : (s.endsWith('k') ? 1000 : (s.endsWith('m') ? 1000000 : 1));
-            s = s.replace(/[mk]|mil/g, '');
+            s = s.replace(/[mk]|mil/g, '').trim();
             sold = Math.round(parseFloat(s) * mul);
           }
 
@@ -2419,11 +2451,12 @@ async function discoverViaHtmlDom({ url, limit = 60, scrolls = 2 } = {}) {
           const locMatch = txt.match(/(São Paulo|Rio de Janeiro|Minas Gerais|Paraná|Bahia|Pernambuco|Goiás|Ceará|Santa Catarina|Rio Grande do Sul|Espírito Santo|Distrito Federal|Mato Grosso|[A-ZÀ-Ú][a-zà-ú]+\\s*\\([A-Z]{2}\\))/);
           if (locMatch) shopLocation = locMatch[0];
 
-          if (name && priceCents > 0) {
+          if (priceCents > 0) {
             items.push({
-              itemid: itemid,
-              shopid: shopid,
-              name: name,
+              itemid: c.itemid,
+              shopid: c.shopid,
+              catid: c.catid || '',
+              name: name || `Item ${c.itemid}`,
               image: imageHash || image,
               price: priceCents * 1000,
               price_min: priceCents * 1000,
@@ -2909,11 +2942,13 @@ http.createServer(async (req, res) => {
     let target = d.url;
     if (!target) {
       if (d.category_id) {
-        target = `https://shopee.com.br/Mais-Vendidos-cat.${d.category_id}`;
+        // Shopee BR: /cat.X (ou /search?fe_categoryids=X) — testar com query keyword genérica
+        target = `https://shopee.com.br/search?fe_categoryids=${d.category_id}&page=0&sortBy=sales`;
       } else if (d.keyword) {
-        target = `https://shopee.com.br/buscar?keyword=${encodeURIComponent(d.keyword)}&sortBy=sales`;
+        target = `https://shopee.com.br/search?keyword=${encodeURIComponent(d.keyword)}&page=0&sortBy=sales`;
       } else {
-        target = `https://shopee.com.br/Mais-Vendidos`;
+        // Sem nada: usar busca genérica popular
+        target = `https://shopee.com.br/search?keyword=oferta&page=0&sortBy=sales`;
       }
     }
     
