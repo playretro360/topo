@@ -2143,18 +2143,22 @@ async function discoverViaBrowser({ category_id, keyword, sort = 'sales', limit 
   const cdp = new CDPBrowser(ws);
 
   try {
+    // Bright Data Scraping Browser: createTarget só permite about:blank
     const newTarget = await cdp.send('Target.createTarget', {
-      url: 'https://shopee.com.br/',
+      url: 'about:blank',
       newWindow: false,
       background: true,
     });
     const newTargetId = newTarget.targetId;
     const { sessionId: sid2 } = await cdp.send('Target.attachToTarget', { targetId: newTargetId, flatten: true });
     const s = cdp.session(sid2);
+    await s.send('Page.enable', {}).catch(()=>{});
     await s.send('Network.enable', {}).catch(()=>{});
 
-    // 1s pro JS context inicializar
-    await new Promise(r => setTimeout(r, 1000));
+    // Navegar pra shopee.com.br pra estabelecer contexto
+    await s.send('Page.navigate', { url: 'https://shopee.com.br/' });
+    // Aguardar 3s pro JS context inicializar (não precisa do page load completo)
+    await new Promise(r => setTimeout(r, 3000));
 
     // Map de sort → 'by' param
     const byMap = { sales: 'sales', pop: 'pop', latest: 'ctime', price_asc: 'price', price_desc: 'price' };
