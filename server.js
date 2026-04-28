@@ -2886,7 +2886,8 @@ function unlockerReq(targetUrl, zone) {
 // 🖥️ HTTP SERVER v13 — 2500+ ENDPOINTS ELÁSTICOS
 // ════════════════════════════════════════════════════════════
 http.createServer(async (req, res) => {
-  const p = url_mod.parse(req.url, true).pathname;
+  const url = new URL(req.url, "http://x");
+  const p = url.pathname;
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Access-Control-Allow-Origin', '*');
   if (req.method === 'OPTIONS') { res.writeHead(200); return res.end(); }
@@ -3444,7 +3445,7 @@ http.createServer(async (req, res) => {
           const { protocol: proto, hostname } = new url_mod.URL('https://api.brightdata.com/request');
           const opts = {
             hostname, port: 443, path: '/request', method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer '+(process.env.BD_API_TOKEN||'') },
+            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer '+(process.env.BD_UNLOCKER_KEY||'') },
           };
           const req_ = https.request(opts, r => {
             const chunks = [];
@@ -3780,7 +3781,7 @@ http.createServer(async (req, res) => {
 
 
   // ── /img — proxy de imagem binário (GET ?url=) ──
-  if (req.method === 'GET' && pathname === '/img') {
+  if (req.method === 'GET' && p === '/img') {
     const imgUrl = url.searchParams.get('url') || '';
     if (!imgUrl) { res.writeHead(400); return res.end('url obrigatoria'); }
     
@@ -3822,7 +3823,7 @@ http.createServer(async (req, res) => {
 
 
 
-  if (pathname === '/proxy-image') {
+  if (p === '/proxy-image') {
     let imgUrl = '';
     if (req.method === 'GET') {
       imgUrl = url.searchParams.get('url') || '';
